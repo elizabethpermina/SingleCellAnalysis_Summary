@@ -1,0 +1,171 @@
+---
+title: "summary of analysis"
+output: html_notebook
+---
+
+## QC steps
+
+QC included filtration by library size and mitochondrial genes expression characteristic of apoptosis
+Library size filtration is used to filter out multiple cells in the same reading spot (too high) or degraded cells and cells absent from library prep (library size is too low). 
+cell cycle markers were used to discriminate G1 vs G2
+we also filtered out low-expressed genes and some of the housekeeping genes (ribosomal)
+## dimentionality reduction
+
+The clustering and dimentionality reduction was done on the most biologically variable genes in the set
+
+```{r Variance}
+var.fit <- trendVar(sce, method="loess", use.spikes=FALSE) 
+var.out <- decomposeVar(sce, var.fit, get.spikes = FALSE)
+sce.out <- var.out[which(var.out$FDR <= 0.05 & var.out$bio >= 0.5),]
+sce.out <- sce.out[order(sce.out$bio, decreasing=TRUE),]
+```
+
+```{r varCor}
+set.seed(100)
+var.cor <- correlatePairs(sce, subset.row=rownames(sce.out)) 
+write.table(file="../results/tables/SCAnalysis-HighlyExpressedCorrelatedGenes.tsv", var.cor, sep="\t", quote=FALSE, row.names=FALSE) 
+head(var.cor)
+```
+
+### PCA
+```{r PCAForQC, eval = FALSE}
+ # sce is a SingleCell object created by SingleCellExperiment() function
+sce<- normalize(sce)
+pdf("../results/figures/SingleCellAnalysis-PCALibrarySizedQC.pdf")
+scater::plotPCA(sce, by_exprs_values="logcounts") + fontsize
+scater::plotPCA(sce, by_exprs_values="counts") + fontsize
+dev.off()
+```
+
+### tSNE
+
+comparing different perplexity settings
+```{r, eval = FALSE}
+set.seed(100)
+out5 <- plotTSNE(sce, exprs_values="exprs", perplexity=5, colour_by="total_features_by_counts",
+feature_set=chosen) + fontsize + ggtitle("Perplexity = 5")
+out10 <- plotTSNE(sce, exprs_values="exprs", perplexity=10, colour_by="total_features_by_counts",
+feature_set=chosen) + fontsize + ggtitle("Perplexity = 10")
+out20 <- plotTSNE(sce, exprs_values="exprs", perplexity=20, colour_by="total_features_by_counts",
+feature_set=chosen) + fontsize + ggtitle("Perplexity = 20") multiplot(out5, out10, out20, cols=3)
+```
+
+plotting tSNE for a chosen gene
+
+(tdTomato is a marker of knockout genotype)
+
+```{r plotTSNE}
+top.sce <- "Cdh1"
+sce<-runTSNE(sce)
+tsne1 <- plotTSNE(sce, colour_by=top.sce) + fontsize
+tsne2 <- plotTSNE(sce, colour_by="tdTomato") + fontsize
+```
+
+```{r writePDF}
+pdf("../results/figures/SCAnalysis-TsneTomatoAndCdh1.pdf")
+multiplot(tsne1, tsne2, cols=2)
+dev.off()
+```
+
+## DE analysis
+
+estimateDisp is used here as an acceptable way of dealing with zero-inflated data
+
+```{r DEFactorGroups, cache = TRUE, eval = FALSE}
+## as discussed here
+cdh1ExprFactor<-factor(cdh1ExprFactor )
+cluster <- factor(my.clusters)
+design <- model.matrix(~0+cdh1ExprFactor)
+cont.mat <- makeContrasts((cdh1ExprFactor2+cdh1ExprFactor3+cdh1ExprFactor4)/3-cdh1ExprFactor1, levels=design)
+yContr <-DGEList(sce@assays@data$counts)
+yContr <- estimateDisp(yContr, design) 
+fitContr <- glmQLFit(yContr, design)
+fitContr<- glmQLFTest(fitContr, contrast = cont.mat)
+DE_sceContr<-topTags(fitContr, n = nrow(y$counts))
+DE_sceContr<-DE_sce1[DE_sce1$FDR< 0.01, c(10, 11, 13, 14)]
+```
+
+## gene onthology enrichment analysis
+
+we have found that REACTOME is the most relevant onthology set for the function analysis
+
+```{r runGO_Function}
+rName <- as.list(reactomePATHNAME2ID) 
+rName <- rName[grep("Mus musculus", names(rName))]
+rGenes <- as.list(reactomePATHID2EXTID)
+rGenesPath <- rGenes[match(rName, names(rGenes))]
+rGenesPath <- lapply(rGenesPath, unique)
+rGeneByPath <- as.list(reactomeEXTID2PATHID)
+runGO<-function(de_genes_table, FWER = 0.01) {
+# de_genes_table is a result of running differential expression analysis function (limma/edgeR/deSEQ2)
+de_genes_table<-de_genes_table[de_genes_table$FWER < FWER, ]
+de.genes<-rownames(de_genes_table)
+de.genes<-Trivial2EntrezMM(de.genes) # translating gene names into Entrez ids
+de.genes<-de.genes[!is.na(de.genes)]
+#... some NA filtering steps are skipped
+myGenes<-Trivial2EntrezMM(rownames(de_genes_table))
+allGenes <- intersect(myGenes, unique(unlist(rGenesPath)) )
+sigGenes <- as.integer(allGenes%in%de.genes)
+names(sigGenes) <- allGenes
+# normalising on gene length
+geneLengths <- getlength(allGenes, "mm9", id="knownGene")
+mt <- match(allGenes, names(rGeneByPath))
+rGeneByPath <- lapply(rGeneByPath[mt], function(x) intersect(x, names(rGenesPath)))
+sigGenes<-sigGenes[!duplicated(names(sigGenes))]
+
+# run GO enrichment function
+
+pwf <- nullp(sigGenes, 'mm9', id = "knownGene", plot.fit=TRUE)
+goseqReactome <- goseq(pwf, gene2cat = rGeneByPath)
+rID2Name <- as.list(reactomePATHID2NAME)
+rID2Name <- rID2Name[grep("Mus musculus", rID2Name)]
+rID2NameVector<-unlist(rID2Name)
+rID2NameDf<-data.frame(names = rID2NameVector, category = names(rID2NameVector))
+goseqReactomeNamed<-merge(x= goseqReactome, y= rID2NameDf, by= 'category', all.x= T)
+return(goseqReactomeNamed)
+}
+```
+
+### cell type prediction
+
+we had some training data with known cell type and used that to set cell type marker expression wich we used to set a cutoff for marker expression levels (we were mostly interested in fibroblasts and stomach development types) 
+marker expression was noted as a logical vector in cell.data table
+names(cell.data) = 
+genotype
+cluster
+batch
+Cdh1_expressed
+fibroblast_markers_expressed
+stage1_genes_expessed
+stage2_gene_expressed
+treated
+type
+
+```{r}
+set.seed(100)
+tr = sample(nrow(cell.data),round(2/3*nrow(cell.data)))
+trDat = cell.data[tr,]
+tsDat = cell.data[-tr,]
+fit = glm(type ~ fibroblast_markers_expressed, family = "binomial", data = trDat)
+pred = predict(fit, type="response")
+predR = ifelse(pred > cut, 1, 0)
+confTab = table(trDat$type, predR, dnn=c("type","predR")) 
+sens = prop.table(confTab,1)[2,2] 
+spec = prop.table(confTab,1)[1,1] 
+round(c(sens,spec),3)
+fisher.test(confTab)
+
+```
+
+... with cross-validation
+
+```{r}
+pred = rep(0, nrow(trDat)) predR = rep(0, nrow(trDat)) for(i in 1:10){
+trCV = trDat[splt!=i,]
+tsCV = trDat[splt==i,]
+f = as.formula(type ~ fibroblast_markers_expressed) stepFit = glm(type ~ 1,family='binomial', data=trCV) stepFit = step(stepFit, scope=f)
+pred[splt==i] = predict(stepFit, newdata=tsCV, type='response') cut = sum(trCV$type) / nrow(trCV)
+predR[splt==i] = ifelse(pred[splt==i] > cut, 1, 0)
+}
+```
+
